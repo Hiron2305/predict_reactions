@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -71,16 +72,17 @@ def train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_
                 
                 assert outputs.shape == y_batch.shape, f"Output shape {outputs.shape} and target shape {y_batch.shape} mismatch!"
                 
-                loss = criterion(outputs, y_batch)
+                loss = criterion(outputs.sum(axis=2), y_batch.sum(axis=2))
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
-                num_items += len(y_batch)
+                num_items += y_batch.shape[1]
 
             del X_train, y_train
             torch.cuda.empty_cache()
         epoch_mean_loss = epoch_loss / num_items
-        logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_mean_loss:.4f}")
+        epoch_rmse = epoch_mean_loss ** 0.5
+        logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_rmse:.4f}")
 
     logging.info("Training complete. Starting evaluation...")
     evaluate_model(model, X_test_files, y_test_files, batch_size, fixed_seq_len)
@@ -103,18 +105,18 @@ def evaluate_model(model, X_test_files, y_test_files, batch_size=128, fixed_seq_
 
             for X_batch, y_batch in test_loader:
                 outputs = model(X_batch)
-
                 assert outputs.shape == y_batch.shape, f"Output shape {outputs.shape} and target shape {y_batch.shape} mismatch!"
                 
-                loss = criterion(outputs, y_batch)
+                loss = criterion(outputs.sum(axis=2), y_batch.sum(axis=2))
                 total_loss += loss.item()
-                num_items += len(y_batch)
+                num_items += y_batch.shape[1]
 
             del X_test, y_test
             torch.cuda.empty_cache()
 
     total_mean_loss = total_loss / num_items
-    logging.info(f"Test Loss: {total_mean_loss:.4f}")
+    total_rmse = total_mean_loss ** 0.5
+    logging.info(f"Test Loss: {total_rmse:.4f}")
 
 
 
