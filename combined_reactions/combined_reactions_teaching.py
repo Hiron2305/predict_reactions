@@ -39,7 +39,7 @@ def pad_tensors(tensors, target_length=None):
 def load_batches_with_padding(file_paths, target_size=None):
     data = []
     for path in file_paths:
-        logging.info(f"Loading {path}...")
+        logging.debug(f"Loading {path}...")
         batch = joblib.load(path)
         data.append(torch.tensor(batch, dtype=torch.float32))
     
@@ -54,6 +54,7 @@ def train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0
+        num_items = 0
 
         for X_train_path, y_train_path in zip(X_train_files, y_train_files):
             X_train = load_batches_with_padding([X_train_path], target_size=fixed_seq_len)
@@ -74,11 +75,12 @@ def train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
+                num_items += len(y_batch)
 
             del X_train, y_train
             torch.cuda.empty_cache()
-
-        logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+        epoch_mean_loss = epoch_loss / num_items
+        logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_mean_loss:.4f}")
 
     logging.info("Training complete. Starting evaluation...")
     evaluate_model(model, X_test_files, y_test_files, batch_size, fixed_seq_len)
@@ -86,6 +88,7 @@ def train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_
 def evaluate_model(model, X_test_files, y_test_files, batch_size=128, fixed_seq_len=10000):
     model.eval()
     total_loss = 0
+    num_items = 0
     criterion = nn.MSELoss()
 
     with torch.no_grad():
@@ -105,11 +108,13 @@ def evaluate_model(model, X_test_files, y_test_files, batch_size=128, fixed_seq_
                 
                 loss = criterion(outputs, y_batch)
                 total_loss += loss.item()
+                num_items += len(y_batch)
 
             del X_test, y_test
             torch.cuda.empty_cache()
 
-    logging.info(f"Test Loss: {total_loss:.4f}")
+    total_mean_loss = total_loss / num_items
+    logging.info(f"Test Loss: {total_mean_loss:.4f}")
 
 
 
