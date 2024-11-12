@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 logging.info("Загрузка данных и эмбеддингов")
 df = pd.read_csv("cleaned_data.csv")
-embeddings = torch.load("embeddings.pt")
+embeddings = torch.load("../embeddings.pt")
 
 logging.info("Применение эмбеддингов к текстам")
 df['embedding'] = df['Text'].apply(lambda text: embeddings.get(text))
@@ -109,7 +109,7 @@ for epoch in range(num_epochs):
 
     logging.info(f"Эпоха [{epoch + 1}/{num_epochs}], Потеря: {avg_loss:.4f} ({loss_percentage:.2f}% от начальной)")
 
-model_save_path = "reaction_predictor_model.pth"
+model_save_path = "../reaction_predictor_model.pth"
 torch.save(model.state_dict(), model_save_path)
 logging.info(f"Модель сохранена в {model_save_path}")
 
