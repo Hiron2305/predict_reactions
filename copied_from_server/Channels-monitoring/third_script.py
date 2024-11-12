@@ -1,209 +1,116 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import joblib
+import pandas as pd
+from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
 import logging
-import os
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
 
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-class MultiOutputRegressionModel(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(MultiOutputRegressionModel, self).__init__()
-        self.output_dim = output_dim
-        self.linear = nn.Linear(input_dim, output_dim * 3)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+logging.info("Загрузка данных и эмбеддингов")
+df = pd.read_csv("cleaned_data.csv")
+embeddings = torch.load("embeddings.pt")
+
+logging.info("Применение эмбеддингов к текстам")
+df['embedding'] = df['Text'].apply(lambda text: embeddings.get(text))
+df = df.dropna(subset=['embedding'])
+
+df = df[df['Reactions'].notnull()]
+reaction_types = set()
+for reactions in df['Reactions']:
+    try:
+        parsed_reactions = eval(reactions) if isinstance(reactions, str) and reactions.startswith("{") else {}
+        if isinstance(parsed_reactions, dict):
+            reaction_types.update(parsed_reactions.keys())
+    except (SyntaxError, TypeError, ValueError) as e:
+        logging.warning(f"Ошибка при обработке реакции: {reactions} - {e}")
+
+reaction_types = sorted(filter(lambda x: x is not None, reaction_types))
+emoji_to_id = {emoji: idx for idx, emoji in enumerate(reaction_types)}
+logging.info(f"Уникальные типы реакций (emoji): {reaction_types}")
+
+
+def reaction_vector(reactions):
+    vec = [0] * len(reaction_types)
+    if isinstance(reactions, str):
+        try:
+            reactions = eval(reactions)
+        except (SyntaxError, TypeError, ValueError) as e:
+            logging.warning(f"Ошибка при преобразовании реакции: {reactions} - {e}")
+            reactions = {}
+    if isinstance(reactions, dict):
+        for emoji, count in reactions.items():
+            if emoji in emoji_to_id:
+                vec[emoji_to_id[emoji]] = count
+    return vec
+
+
+df['reaction_vector'] = df['Reactions'].apply(reaction_vector)
+
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+
+class ReactionDataset(Dataset):
+    def __init__(self, dataframe):
+        self.data = dataframe
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        embedding = torch.tensor(self.data.iloc[idx]['embedding'], dtype=torch.float32)
+        reaction_vector = torch.tensor(self.data.iloc[idx]['reaction_vector'], dtype=torch.float32)
+        return embedding, reaction_vector
+
+
+train_dataset = ReactionDataset(train_df)
+test_dataset = ReactionDataset(test_df)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32)
+
+
+class ReactionPredictor(torch.nn.Module):
+    def __init__(self, input_size, output_size):
+        super(ReactionPredictor, self).__init__()
+        self.fc = torch.nn.Linear(input_size, output_size)
 
     def forward(self, x):
-        return self.linear(x).view(-1, 10000, 3)
+        return self.fc(x)
 
 
+model = ReactionPredictor(input_size=len(train_df['embedding'].iloc[0]), output_size=len(reaction_types))
+criterion = torch.nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-def pad_tensors(tensors, target_length=None):
-    if target_length is None:
-        max_size = max(tensor.shape[0] for tensor in tensors)
-    else:
-        max_size = target_length
+logging.info("Начало обучения модели")
+num_epochs = 10
+initial_loss = None
 
-    padded_tensors = []
-    for tensor in tensors:
-        padding_size = max_size - tensor.shape[0]
-        if padding_size > 0:
-            padded_tensor = nn.functional.pad(tensor, (0, 0, 0, padding_size), "constant", 0)
-            padded_tensors.append(padded_tensor)
-        else:
-            padded_tensors.append(tensor)
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0.0
+    batch_count = 0
 
-    return torch.stack(padded_tensors)
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
 
+        epoch_loss += loss.item()
+        batch_count += 1
 
-def load_batches_with_padding(file_paths, target_size=None):
-    data = []
-    for path in file_paths:
-        logging.debug(f"Loading {path}...")
-        batch = joblib.load(path)
-        batch = torch.tensor(batch, dtype=torch.float32)
+    avg_loss = epoch_loss / batch_count
 
-        if len(batch.shape) == 3 and batch.shape[0] == 1:
-            batch = batch.squeeze(0)
+    if initial_loss is None:
+        initial_loss = avg_loss
 
-        logging.info(f"Loaded batch from {path}, shape: {batch.shape}")
+    loss_percentage = (avg_loss / initial_loss) * 100 if initial_loss else 100
 
-        data.append(batch)
+    logging.info(f"Эпоха [{epoch + 1}/{num_epochs}], Потеря: {avg_loss:.4f} ({loss_percentage:.2f}% от начальной)")
 
-    return pad_tensors(data, target_size)
+model_save_path = "reaction_predictor_model.pth"
+torch.save(model.state_dict(), model_save_path)
+logging.info(f"Модель сохранена в {model_save_path}")
 
-
-
-def train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_dim, output_dim, num_epochs=10,
-                batch_size=128, lr=0.001, fixed_seq_len=10000):
-    model = MultiOutputRegressionModel(input_dim, output_dim).to(DEVICE)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    logging.info("Starting training...")
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_loss = 0
-        num_items = 0
-
-        for X_train_path, y_train_path in zip(X_train_files, y_train_files):
-            X_train = load_batches_with_padding([X_train_path], target_size=fixed_seq_len)
-            y_train = load_batches_with_padding([y_train_path], target_size=fixed_seq_len)
-
-            logging.info(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-
-            X_train, y_train = X_train.to(DEVICE), y_train.to(DEVICE)
-
-            dataset = TensorDataset(X_train, y_train)
-            train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-            for X_batch, y_batch in train_loader:
-                optimizer.zero_grad()
-                outputs = model(X_batch)
-
-                logging.info(f"Train: y_batch shape: {y_batch.shape}, outputs shape: {outputs.shape}")
-
-                assert outputs.shape == y_batch.shape, f"Output shape {outputs.shape} and target shape {y_batch.shape} mismatch!"
-
-                loss = criterion(outputs, y_batch)
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-                num_items += y_batch.shape[1]
-
-            del X_train, y_train
-            torch.cuda.empty_cache()
-        epoch_mean_loss = epoch_loss / num_items
-        epoch_rmse = epoch_mean_loss ** 0.5
-        logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_rmse:.4f}")
-
-    evaluate_model(model, X_test_files, y_test_files, batch_size, fixed_seq_len)
-
-
-def evaluate_model(model, X_test_files, y_test_files, batch_size=128, fixed_seq_len=10000):
-    model.eval()
-    total_loss = 0
-    num_items = 0
-    criterion = nn.MSELoss()
-    all_actual = []
-    all_predicted = []
-
-    with torch.no_grad():
-        for X_test_path, y_test_path in zip(X_test_files, y_test_files):
-            X_test = load_batches_with_padding([X_test_path], target_size=fixed_seq_len)
-            y_test = load_batches_with_padding([y_test_path], target_size=fixed_seq_len)
-
-            X_test, y_test = X_test.to(DEVICE), y_test.to(DEVICE)
-
-            dataset = TensorDataset(X_test, y_test)
-            test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
-            for X_batch, y_batch in test_loader:
-                outputs = model(X_batch)
-
-                logging.info(f"Test: y_batch shape: {y_batch.shape}, outputs shape: {outputs.shape}")
-
-                assert outputs.shape == y_batch.shape, f"Output shape {outputs.shape} and target shape {y_batch.shape} mismatch!"
-
-                loss = criterion(outputs, y_batch)
-                total_loss += loss.item()
-                num_items += y_batch.shape[1]
-
-                all_actual.append(y_batch.cpu().numpy())
-                all_predicted.append(outputs.cpu().numpy())
-
-            del X_test, y_test
-            torch.cuda.empty_cache()
-
-    total_mean_loss = total_loss / num_items
-    total_rmse = total_mean_loss ** 0.5
-    logging.info(f"Test Loss: {total_rmse:.4f}")
-
-    all_actual = np.concatenate(all_actual)
-    all_predicted = np.concatenate(all_predicted)
-
-    if all_actual.shape == all_predicted.shape:
-        plot_separate_scatter(all_actual.flatten(), all_predicted.flatten())
-    else:
-        logging.error(f"Size mismatch: actual size {all_actual.shape}, predicted size {all_predicted.shape}")
-
-
-import matplotlib.pyplot as plt
-
-
-def plot_separate_scatter(actual, predicted):
-    plt.figure(figsize=(14, 6))
-
-    plt.subplot(1, 2, 1)
-    plt.scatter(range(len(actual)), actual, alpha=0.5, color='blue')
-    plt.xlabel("Index")
-    plt.ylabel("Actual Reactions")
-    plt.title("Actual Reactions per Post")
-    plt.grid(True)
-
-    plt.subplot(1, 2, 2)
-    plt.scatter(range(len(predicted)), predicted, alpha=0.5, color='green')
-    plt.xlabel("Index")
-    plt.ylabel("Predicted Reactions")
-    plt.title("Predicted Reactions per Post")
-    plt.grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def main():
-    try:
-
-        import os
-        logging.info(f"Current directory: {os.getcwd()}")
-        logging.info(f"Files in directory: {os.listdir()}")
-
-        X_train_files = [f for f in os.listdir() if 'X_batch_train' in f]
-        y_train_files = [f for f in os.listdir() if 'y_batch_train' in f]
-        X_test_files = [f for f in os.listdir() if 'X_batch_test' in f]
-        y_test_files = [f for f in os.listdir() if 'y_batch_test' in f]
-
-
-
-        if not (X_train_files and y_train_files and X_test_files and y_test_files):
-            raise FileNotFoundError("Не удалось найти файлы для обучения и тестирования.")
-
-        X_train_sample = joblib.load(X_train_files[0])
-        X_train_sample = torch.tensor(X_train_sample, dtype=torch.float32)
-        input_dim = X_train_sample.shape[1]
-
-        y_train_sample = joblib.load(y_train_files[0])
-        y_train_sample = torch.tensor(y_train_sample, dtype=torch.float32)
-        output_dim = y_train_sample.shape[1] // 3
-
-        train_model(X_train_files, y_train_files, X_test_files, y_test_files, input_dim, output_dim, num_epochs=5,
-                    batch_size=128, lr=0.001)
-
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-
-
-if __name__ == '__main__':
-    main()
+logging.info("Обучение завершено")
